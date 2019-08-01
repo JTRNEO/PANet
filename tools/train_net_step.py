@@ -29,6 +29,7 @@ from utils.detectron_weight_helper import load_detectron_weight
 from utils.logging import setup_logging
 from utils.timer import Timer
 from utils.training_stats import TrainingStats
+import horovod.torch as hvd
 
 # Set up logging and load config options
 logger = setup_logging(__name__)
@@ -60,6 +61,13 @@ def parse_args():
         default=20, type=int)
     parser.add_argument(
         '--no_cuda', dest='cuda', help='Do not use CUDA device', action='store_false')
+    
+    
+    parser.add_argument('--fp16-allreduce', action='store_true', default=False,
+                    help='use fp16 compression during allreduce')
+
+    parser.add_argument('--seed', type=int, default=42, metavar='S',
+                    help='random seed (default: 42)')
 
     # Optimization
     # These options has the highest prioity and can overwrite the values in config file
@@ -137,10 +145,14 @@ def save_ckpt(output_dir, args, step, train_size, model, optimizer):
 
 def main():
     """Main function"""
+    hvd.init()
+    torch.cuda.set_device(hvd.local_rank())
+
 
     args = parse_args()
     print('Called with args:')
     print(args)
+    torch.manual_seed(args.seed)
 
     if not torch.cuda.is_available():
         sys.exit("Need a CUDA device to run the code.")
@@ -169,7 +181,8 @@ def main():
     original_num_gpus = cfg.NUM_GPUS
     if args.batch_size is None:
         args.batch_size = original_batch_size
-    cfg.NUM_GPUS = torch.cuda.device_count()
+    #cfg.NUM_GPUS = torch.cuda.device_count()
+    cfg.NUM_GPUS = 1
     assert (args.batch_size % cfg.NUM_GPUS) == 0, \
         'batch_size: %d, NUM_GPUS: %d' % (args.batch_size, cfg.NUM_GPUS)
     cfg.TRAIN.IMS_PER_BATCH = args.batch_size // cfg.NUM_GPUS
@@ -185,7 +198,7 @@ def main():
     # For iter_size > 1, gradients are `accumulated`, so lr is scaled based
     # on batch_size instead of effective_batch_size
     old_base_lr = cfg.SOLVER.BASE_LR
-    cfg.SOLVER.BASE_LR *= args.batch_size / original_batch_size
+    cfg.SOLVER.BASE_LR *= (args.batch_size / original_batch_size)*hvd.size()
     print('Adjust BASE_LR linearly according to batch_size change:\n'
           '    BASE_LR: {} --> {}'.format(old_base_lr, cfg.SOLVER.BASE_LR))
 
@@ -227,7 +240,7 @@ def main():
     ### Dataset ###
     timers['roidb'].tic()
     roidb, ratio_list, ratio_index = combined_roidb_for_training(
-        cfg.TRAIN.DATASETS, cfg.TRAIN.PROPOSAL_FILES)
+        cfg.TRAIN.DATASETS, cfg.TRAIN.PROPOSAL_FILES,hvd.size())
     timers['roidb'].toc()
     roidb_size = len(roidb)
     logger.info('{:d} roidb entries'.format(roidb_size))
@@ -305,6 +318,15 @@ def main():
         optimizer = torch.optim.SGD(params, momentum=cfg.SOLVER.MOMENTUM)
     elif cfg.SOLVER.TYPE == "Adam":
         optimizer = torch.optim.Adam(params)
+    
+    # Horovod: (optional) compression algorithm.
+    compression = hvd.Compression.fp16 if args.fp16_allreduce else hvd.Compression.none
+    hvd.broadcast_parameters(maskRCNN.state_dict(), root_rank=0)
+    hvd.broadcast_optimizer_state(optimizer, root_rank=0)
+    # Horovod: wrap optimizer with DistributedOptimizer.
+    optimizer = hvd.DistributedOptimizer(optimizer,
+                                     named_parameters=maskRCNN.named_parameters(),
+                                     compression=compression)
 
     ### Load checkpoint
     if args.load_ckpt:
@@ -335,7 +357,7 @@ def main():
 
     lr = optimizer.param_groups[0]['lr']  # lr of non-bias parameters, for commmand line outputs.
 
-    maskRCNN = mynn.DataParallel(maskRCNN, cpu_keywords=['im_info', 'roidb'],
+    maskRCNN = mynn.DataParallel(maskRCNN, device_ids=[hvd.local_rank()],cpu_keywords=['im_info', 'roidb'],
                                  minibatch=True)
 
     ### Training Setups ###
@@ -343,7 +365,7 @@ def main():
     output_dir = misc_utils.get_output_dir(args, args.run_name)
     args.cfg_filename = os.path.basename(args.cfg_file)
 
-    if not args.no_save:
+    if not args.no_save and hvd.rank()==0:
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
 
@@ -435,7 +457,8 @@ def main():
 
         # ---- Training ends ----
         # Save last checkpoint
-        save_ckpt(output_dir, args, step, train_size, maskRCNN, optimizer)
+        if hvd.rank()==0:
+            save_ckpt(output_dir, args, step, train_size, maskRCNN, optimizer)
 
     except (RuntimeError, KeyboardInterrupt):
         del dataiterator
@@ -452,3 +475,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
