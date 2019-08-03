@@ -381,8 +381,8 @@ def main():
     ### Training Loop ###
     maskRCNN.train()
 
-    CHECKPOINT_PERIOD = int(cfg.TRAIN.SNAPSHOT_ITERS / cfg.NUM_GPUS)
-
+    CHECKPOINT_PERIOD = int(cfg.TRAIN.SNAPSHOT_ITERS / hvd.size())
+    #CHECKPOINT_PERIOD = 1
     # Set index for decay steps
     decay_steps_ind = None
     for i in range(1, len(cfg.SOLVER.STEPS)):
@@ -452,7 +452,7 @@ def main():
 
             training_stats.LogIterStats(step, lr)
 
-            if (step+1) % CHECKPOINT_PERIOD == 0:
+            if (step+1) % CHECKPOINT_PERIOD == 0 and hvd.rank() == 0:
                 save_ckpt(output_dir, args, step, train_size, maskRCNN, optimizer)
 
         # ---- Training ends ----
@@ -475,4 +475,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

@@ -174,12 +174,14 @@ class TrainingStats(object):
 
     def LogIterStats(self, cur_iter, lr):
         """Log the tracked statistics."""
-        if (cur_iter % self.LOG_PERIOD == 0 or
-                cur_iter == cfg.SOLVER.MAX_ITER - 1):
-            stats = self.GetStats(cur_iter, lr)
-            log_stats(stats, self.misc_args)
-            if self.tblogger:
-                self.tb_log_stats(stats, cur_iter)
+        import horovod.torch as hvd
+        if hvd.rank()==0:
+                if (cur_iter % self.LOG_PERIOD == 0 or
+                        cur_iter == cfg.SOLVER.MAX_ITER - 1):
+                    stats = self.GetStats(cur_iter, lr)
+                    log_stats(stats, self.misc_args)
+                    if self.tblogger:
+                        self.tb_log_stats(stats, cur_iter)
 
     def tb_log_stats(self, stats, cur_iter):
         """Log the tracked statistics to tensorboard"""
